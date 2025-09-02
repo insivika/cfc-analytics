@@ -1,10 +1,10 @@
 import { ClickHouseClient, createClient } from '@clickhouse/client';
 import { formatInTimeZone } from 'date-fns-tz';
 import debug from 'debug';
-import { CLICKHOUSE } from 'lib/db';
+import { CLICKHOUSE } from '@/lib/db';
+import { getWebsite } from '@/queries';
 import { DEFAULT_PAGE_SIZE, OPERATORS } from './constants';
 import { maxDate } from './date';
-import { fetchWebsite } from './load';
 import { filtersToArray } from './params';
 import { PageParams, QueryFilters, QueryOptions } from './types';
 
@@ -68,6 +68,10 @@ function getDateSQL(field: string, unit: string, timezone?: string) {
   return `toDateTime(date_trunc('${unit}', ${field}))`;
 }
 
+function getSearchSQL(column: string, param: string = 'search'): string {
+  return `and positionCaseInsensitive(${column}, {${param}:String}) > 0`;
+}
+
 function mapFilter(column: string, operator: string, name: string, type: string = 'String') {
   const value = `{${name}:${type}}`;
 
@@ -85,13 +89,28 @@ function mapFilter(column: string, operator: string, name: string, type: string 
   }
 }
 
+function mapCohortFilter(column: string, operator: string, value: string) {
+  switch (operator) {
+    case OPERATORS.equals:
+      return `${column} = '${value}'`;
+    case OPERATORS.notEquals:
+      return `${column} != '${value}'`;
+    case OPERATORS.contains:
+      return `positionCaseInsensitive(${column}, '${value}') > 0`;
+    case OPERATORS.doesNotContain:
+      return `positionCaseInsensitive(${column}, '${value}') = 0`;
+    default:
+      return '';
+  }
+}
+
 function getFilterQuery(filters: QueryFilters = {}, options: QueryOptions = {}) {
   const query = filtersToArray(filters, options).reduce((arr, { name, column, operator }) => {
     if (column) {
       arr.push(`and ${mapFilter(column, operator, name)}`);
 
       if (name === 'referrer') {
-        arr.push('and referrer_domain != {websiteDomain:String}');
+        arr.push(`and referrer_domain != hostname`);
       }
     }
 
@@ -99,6 +118,42 @@ function getFilterQuery(filters: QueryFilters = {}, options: QueryOptions = {}) 
   }, []);
 
   return query.join('\n');
+}
+
+function getCohortQuery(websiteId: string, filters: QueryFilters = {}, options: QueryOptions = {}) {
+  const query = filtersToArray(filters, options).reduce(
+    (arr, { name, column, operator, value }) => {
+      if (column) {
+        arr.push(
+          `${arr.length === 0 ? 'where' : 'and'} ${mapCohortFilter(column, operator, value)}`,
+        );
+
+        if (name === 'referrer') {
+          arr.push(`and referrer_domain != hostname`);
+        }
+      }
+
+      return arr;
+    },
+    [],
+  );
+
+  if (query.length > 0) {
+    // add website and date range filters
+    query.push(`and website_id = '${websiteId}'`);
+    query.push(
+      `and created_at between parseDateTimeBestEffort('${filters.startDate}') and parseDateTimeBestEffort('${filters.endDate}')`,
+    );
+
+    return `join
+    (select distinct session_id
+    from website_event
+    ${query.join('\n')}) cohort
+    on cohort.session_id = website_event.session_id
+    `;
+  }
+
+  return '';
 }
 
 function getDateQuery(filters: QueryFilters = {}) {
@@ -132,7 +187,7 @@ function getFilterParams(filters: QueryFilters = {}) {
 }
 
 async function parseFilters(websiteId: string, filters: QueryFilters = {}, options?: QueryOptions) {
-  const website = await fetchWebsite(websiteId);
+  const website = await getWebsite(websiteId);
 
   return {
     filterQuery: getFilterQuery(filters, options),
@@ -141,8 +196,8 @@ async function parseFilters(websiteId: string, filters: QueryFilters = {}, optio
       ...getFilterParams(filters),
       websiteId,
       startDate: maxDate(filters.startDate, new Date(website?.resetAt)),
-      websiteDomain: website.domain,
     },
+    cohortQuery: getCohortQuery(websiteId, filters?.cohort),
   };
 }
 
@@ -153,12 +208,12 @@ async function pagedQuery(
 ) {
   const { page = 1, pageSize, orderBy, sortDescending = false } = pageParams;
   const size = +pageSize || DEFAULT_PAGE_SIZE;
-  const offset = +size * (page - 1);
+  const offset = +size * (+page - 1);
   const direction = sortDescending ? 'desc' : 'asc';
 
   const statements = [
     orderBy && `order by ${orderBy} ${direction}`,
-    +size > 0 && `limit ${+size} offset ${offset}`,
+    +size > 0 && `limit ${+size} offset ${+offset}`,
   ]
     .filter(n => n)
     .join('\n');
@@ -229,6 +284,7 @@ export default {
   connect,
   getDateStringSQL,
   getDateSQL,
+  getSearchSQL,
   getFilterQuery,
   getUTCString,
   parseFilters,
